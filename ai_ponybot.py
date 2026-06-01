@@ -6,13 +6,6 @@ import math
 import utime
 import ustruct
 
-"""
-from microbit import sleep, i2c, Image
-import math, ustruct
-from machine import time_pulse_us
-import utime
-from ustruct import pack_into
-"""
 
 # PCA9685 레지스터 상수
 PCA9685_ADDRESS = 0x40
@@ -94,7 +87,7 @@ class _PWMController:
 class PonyMotor:
     """포니봇의 DC 모터 제어 클래스."""
 
-    def __init__(self, i2c, motor_channels=None, pwm_freq=1000):
+    def __init__(self, i2c, motor_channels=None, pwm_freq=50):
         self.pwm = _PWMController(i2c)
         self.pwm.set_pwm_frequency(pwm_freq)
 
@@ -431,11 +424,13 @@ FONT_5X7 = bytes([
 
 class PonyColor:
     """TCS34725 색상 센서 제어 클래스"""
-    def __init__(self, i2c, address=0x29):
+    def __init__(self, i2c, version=1, address=0x29):
         self.i2c = i2c
         self.address = address
         self.is_setup = False
-        self.setup()
+        
+        # 1: V1(검은색 모듈), 2: V2(보라색 모듈) 프로파일 매핑
+        self.set_profile(version)
 
     def _write_byte(self, reg, value):
         self.i2c.write(self.address, bytes([0x80 | reg, value]))
@@ -458,51 +453,51 @@ class PonyColor:
             return
         self.is_setup = True
         self._write_byte(0x00, 0x03)  # ENABLE: PON | AEN
-        self._write_byte(0x01, 0xD5)  # ATIME: 103ms (255 - 통합 시간)
+        self._write_byte(0x01, 0xC0)  # ATIME: 154ms 고정
+        self._write_byte(0x0F, 0x03)  # CONTROL: 60x 고이득 레지스터 (0x80 | 0x0F = 0x8F 자동안정화)
 
-    def set_integration_time(self, time_ms):
-        """
-        통합 시간 설정 (0~612ms)
-        time_ms: 2.4 ~ 612ms → 내부적으로 0~255 범위로 변환
-        """
-        time_val = max(0, min(255, int(255 - (time_ms / 2.4))))
-        self._write_byte(0x01, time_val)
+    def set_profile(self, version):
+        """하드웨어 사양별 실측 미니멈/맥시멈 데이터 테이블 갱신"""
+        if version == 1 or version == "V1":
+            self.r_min, self.g_min, self.b_min = 1883, 1866, 1371
+            self.r_max, self.g_max, self.b_max = 18837, 20336, 14248
+        else:
+            self.r_min, self.g_min, self.b_min = 1513, 1006, 800
+            self.r_max, self.g_max, self.b_max = 12590, 9557, 7167
 
     def light(self):
         """Clear 채널 밝기 값"""
         return self._read_raw_data()[0]
 
     def rgb(self):
-        """정규화된 RGB (0~255)"""
+        """실측 기반 2-Point 정규화 8비트 표준 RGB (0~255)"""
         data = self._read_raw_data()
-        c, r, g, b = data
-        if c == 0:
-            return [0, 0, 0]
-        return [int(r * 255 / c), int(g * 255 / c), int(b * 255 / c)]
+        _, r_raw, g_raw, b_raw = data
+        
+        r_255 = max(0, min(255, int((r_raw - self.r_min) / max(1, (self.r_max - self.r_min)) * 255)))
+        g_255 = max(0, min(255, int((g_raw - self.g_min) / max(1, (self.g_max - self.g_min)) * 255)))
+        b_255 = max(0, min(255, int((b_raw - self.b_min) / max(1, (self.b_max - self.b_min)) * 255)))
+        
+        return [r_255, g_255, b_255]
 
     def is_color(self, target, threshold=40):
         """
-        색상 판별: "red", "green", "blue", "yellow"
-        threshold: 민감도 (기본 40)
+        [최적화 알고리즘] 상대적 RGB 우세도 기반 고정밀 색상 판별
+        target: "red", "green", "blue", "yellow"
         """
         r, g, b = self.rgb()
-        c = self.light()
-        if c < 100:
+        
+        if (r + g + b) < 60:
             return False
-        total = r + g + b
-        if total == 0:
-            return False
-        rr, gr, br = r / total, g / total, b / total
-        t = threshold / 255
 
         if target == "red":
-            return rr > gr + t and rr > br + t and rr > 0.4
-        elif target == "green":
-            return gr > rr + t and gr > br + t and gr > 0.4
-        elif target == "blue":
-            return br > rr + t and br > gr + t * 0.8 and br > 0.35
+            return (r > g and r > b and r > g * 1.5)
         elif target == "yellow":
-            return rr > br + t and gr > br + t and abs(rr - gr) < 0.1 and rr + gr > 0.6
+            return (r > b and g > b and r > g and r <= g * 1.5)
+        elif target == "green":
+            return (g > r and g >= b and g > r * 1.4)
+        elif target == "blue":
+            return (b > r and b > g)
         else:
             return False
 
